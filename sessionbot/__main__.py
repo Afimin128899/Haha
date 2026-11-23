@@ -12,6 +12,7 @@ from aiogram.filters import Command
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 
 from . import __version__
+from .config import ConfigError, load_settings
 from .engine import Engine, session_fingerprint
 from .files import ingest
 from .storage import Store
@@ -32,10 +33,9 @@ def keyboard(ident):
 
 async def main():
     os.umask(0o077)
-    allowed = {int(x) for x in os.environ['ALLOWED_IDS'].split(',') if x.strip()}
-    if not allowed:
-        raise RuntimeError('ALLOWED_IDS пуст')
-    root = Path(os.getenv('DATA_DIR', '/data')).resolve()
+    settings = load_settings()
+    allowed = settings.allowed_ids
+    root = settings.data_dir
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     lock = open(root / 'polling.lock', 'w')
     try:
@@ -51,13 +51,11 @@ async def main():
     for folder in (root / 'uploads').glob('*'):
         if folder.is_dir() and folder not in referenced:
             shutil.rmtree(folder, ignore_errors=True)
-    bot = Bot(os.environ['BOT_TOKEN'])
-    concurrency = int(os.getenv('CONCURRENCY', '2'))
-    retention = int(os.getenv('RETENTION_DAYS', '7'))
-    if not 1 <= concurrency <= 16 or not 1 <= retention <= 365:
-        raise RuntimeError('CONCURRENCY: 1..16; RETENTION_DAYS: 1..365')
-    limit = int(os.getenv('MAX_UPLOAD_MB', '20')) * 1024 * 1024
-    engine = Engine(store, bot, int(os.environ['API_ID']), os.environ['API_HASH'], concurrency, retention)
+    bot = Bot(settings.bot_token)
+    concurrency = settings.concurrency
+    retention = settings.retention_days
+    limit = settings.max_upload_mb * 1024 * 1024
+    engine = Engine(store, bot, settings.api_id, settings.api_hash, concurrency, retention)
     dispatcher = Dispatcher()
 
     @dispatcher.message.outer_middleware()
@@ -247,4 +245,8 @@ if __name__ == '__main__':
     logging.basicConfig(level=logging.WARNING, format='%(levelname)s %(message)s')
     logging.getLogger('telethon').disabled = True
     logging.getLogger('telethon').setLevel(logging.CRITICAL)
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except ConfigError as exc:
+        logging.error('Ошибка настройки: %s', exc)
+        raise SystemExit(2) from None
