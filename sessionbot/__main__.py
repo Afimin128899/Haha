@@ -7,7 +7,7 @@ import uuid
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.exceptions import TelegramConflictError, TelegramNetworkError, TelegramRetryAfter
+from aiogram.exceptions import TelegramConflictError, TelegramNetworkError, TelegramRetryAfter, TelegramUnauthorizedError
 from aiogram.filters import Command
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 
@@ -62,6 +62,8 @@ async def main():
     async def private_only(handler, event, data):
         if event.from_user and event.from_user.id in allowed and event.chat.type == 'private':
             return await handler(event, data)
+        if event.chat.type == 'private':
+            logging.warning('Личное сообщение отклонено: ID пользователя отсутствует в ALLOWED_IDS. Укажите числовой Telegram user ID отправителя.')
 
     @dispatcher.callback_query.outer_middleware()
     async def private_callback(handler, event, data):
@@ -209,7 +211,13 @@ async def main():
                 'resume': 'Продолжить', 'cancel': 'Отменить', 'archives': 'Результаты', 'settings': 'Настройки', 'version': 'Версия'}
     worker = asyncio.create_task(engine.loop())
     try:
+        logging.warning('Запуск sessionbot %s: проверка подключения к Bot API.', __version__)
+        identity = await bot.get_me()
+        webhook = await bot.get_webhook_info()
+        if webhook.url:
+            raise ConfigError('Для токена установлен webhook. Отключите webhook перед запуском polling; URL webhook в журнал не выводится.')
         await bot.set_my_commands([BotCommand(command=k, description=v) for k, v in commands.items()])
+        logging.warning('Bot API подключён: @%s. Polling начат; разрешённых ID: %d. Ожидаю /start в личном чате.', identity.username, len(allowed))
         # Explicit polling allows a conflict to stop the service with a clear diagnosis.
         offset = None
         while True:
@@ -224,6 +232,7 @@ async def main():
                 await asyncio.sleep(exc.retry_after)
                 continue
             except TelegramNetworkError:
+                logging.warning('Bot API: ошибка сети при polling; повтор через 3 секунды.')
                 await asyncio.sleep(3)
                 continue
             for update in updates:
@@ -232,6 +241,10 @@ async def main():
                 except Exception as exc:
                     logging.error('Ошибка обработчика: %s', type(exc).__name__)
                 offset = update.update_id + 1
+    except TelegramUnauthorizedError:
+        raise ConfigError('BOT_TOKEN отклонён Telegram. Проверьте актуальный токен в Railway Variables после перевыпуска через BotFather.') from None
+    except TelegramNetworkError:
+        raise ConfigError('Не удалось подключиться к Bot API при запуске. Проверьте сеть Railway и повторите deployment.') from None
     finally:
         worker.cancel()
         await asyncio.gather(worker, return_exceptions=True)
