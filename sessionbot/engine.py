@@ -7,7 +7,9 @@ from pathlib import Path
 
 from telethon import errors, functions
 from .files import persist_zip
-from .telegram import make_client, authorization, migrate, UserFacingError
+from .checkpoints import persist_new_session
+from .cleanup import deep_clean_account
+from .telegram import make_client, authorization, migrate, verify_new, UserFacingError
 
 
 class Engine:
@@ -53,10 +55,47 @@ class Engine:
         except Exception:
             self.store.update(job['id'], stage='Результат сохранён. Ошибка отправки; используйте /archives')
 
+    async def migrate_clean(self, job, old, new, output, config, expected_id):
+        await migrate(old, new, lambda kind, text: self.ask(job, kind, text),
+                      lambda text: self.report(job, text), config)
+        await verify_new(new, expected_id)
+        old_key = getattr(getattr(getattr(old, 'session', None), 'auth_key', None), 'key', None)
+        new_key = getattr(getattr(getattr(new, 'session', None), 'auth_key', None), 'key', None)
+        if isinstance(old_key, bytes) and isinstance(new_key, bytes) and old_key == new_key:
+            raise UserFacingError('Независимая новая авторизация не создана; старая сохранена')
+        safe = {key: value for key, value in config.items() if key in {
+            'device_model', 'system_version', 'app_version', 'lang_code', 'system_lang_code'}}
+        await new.disconnect()
+        saved = persist_new_session(self.store.root, job['owner'], job['id'], 'before_cleanup', output, safe)
+        self.store.update(job['id'], result=str(saved.archive), stage='Новая сессия сохранена до очистки')
+        await new.connect()
+        engine = self
+        class Reporter:
+            async def update(self, text, **kwargs):
+                await engine.report(job, text)
+        report = await deep_clean_account(new, Reporter())
+        await verify_new(new, expected_id)
+        await new.disconnect()
+        saved = persist_new_session(self.store.root, job['owner'], job['id'], 'after_cleanup', output, safe)
+        self.store.update(job['id'], result=str(saved.archive), stage='Результат сохранён; исходная авторизация ещё активна')
+        if report.errors or report.dialogs_failed:
+            raise UserFacingError(f'Очистка частичная: ошибок {len(report.errors)}, диалогов {report.dialogs_failed}. '
+                                  'Новая сессия сохранена; старая авторизация не отзывалась')
+        await self.report(job, 'Новая сессия сохранена. Завершаю только исходную авторизацию')
+        try:
+            async with asyncio.timeout(30):
+                result = await old(functions.auth.LogOutRequest())
+            if not result:
+                raise UserFacingError('Выход из старой авторизации не подтверждён; новая сессия сохранена')
+        except (errors.AuthKeyUnregisteredError, errors.SessionRevokedError, errors.SessionExpiredError):
+            pass  # Source already revoked; the saved new authorization stays active.
+        return str(saved.archive)
+
     async def run_job(self, job):
         ident = job['id']
         work = self.store.root / 'work' / ident
         clients = []
+        combined = job['mode'] == 'migrate_clean'
         try:
             work.mkdir(parents=True, exist_ok=True, mode=0o700)
             original = Path(job['source'])
@@ -87,12 +126,15 @@ class Engine:
                 return
             output = copied
             mode = job['mode']
-            if mode == 'migrate':
+            if mode in {'migrate', 'migrate_clean'}:
                 output = work / 'new.session'
                 new = make_client(output, config, self.api_id, self.api_hash)
                 clients.append(new)
                 await new.connect()
-                await migrate(old, new, lambda kind, text: self.ask(job, kind, text), lambda text: self.report(job, text), config)
+                if combined:
+                    result = await self.migrate_clean(job, old, new, output, config, me.id)
+                else:
+                    await migrate(old, new, lambda kind, text: self.ask(job, kind, text), lambda text: self.report(job, text), config)
             elif mode == 'terminate':
                 await old(functions.auth.ResetAuthorizationsRequest())
                 await self.report(job, 'Другие авторизации завершены; текущая сохранена')
@@ -116,11 +158,13 @@ class Engine:
             for client in reversed(clients):
                 await client.disconnect()
             clients.clear()
-            result = persist_zip(self.store.root / 'results', ident, output, config)
-            self.store.update(ident, state='done', stage='Готово', result=result)
+            if not combined:
+                result = persist_zip(self.store.root / 'results', ident, output, config)
+            stage = ('Готово: новая авторизация сохранена, очистка выполнена, старая завершена' if combined else 'Готово')
+            self.store.update(ident, state='done', stage=stage, result=result)
             await self.deliver(self.store.get(ident))
         except asyncio.CancelledError:
-            if not self.store.get(ident)['result']:
+            if self.store.get(ident)['state'] != 'done':
                 self.store.update(ident, state='cancelled', stage='Отменена; исходный файл сохранён')
             raise
         except errors.FloodWaitError as exc:
@@ -147,7 +191,20 @@ class Engine:
                     await client.disconnect()
                 except Exception:
                     pass
-            shutil.rmtree(work, ignore_errors=True)
+            current = self.store.get(ident)
+            if combined and not current['result'] and (work / 'new.session').exists():
+                # Even cancellation during initial verification can leave a new
+                # authorization. Preserve its only copy, outside normal temp GC.
+                try:
+                    recovery = self.store.root / 'recovery'
+                    recovery.mkdir(exist_ok=True, mode=0o700)
+                    work.rename(recovery / ident)
+                except OSError:
+                    pass  # Leave the work folder intact if moving also fails.
+            else:
+                shutil.rmtree(work, ignore_errors=True)
+            if combined and current['result'] and current['state'] not in {'done', 'cancelled'}:
+                await self.deliver(current)
 
     def cancel(self, owner, ident=None):
         for job in self.store.rows(owner):
@@ -162,6 +219,11 @@ class Engine:
     def expire(self):
         cutoff = time.time() - self.retention
         for row in self.store.db.execute("SELECT * FROM jobs WHERE created<? AND state NOT IN ('running','queued','expired')", (cutoff,)).fetchall():
+            if row['mode'] == 'migrate_clean' and row['result']:
+                shutil.rmtree(Path(row['source']).parent, ignore_errors=True)
+                if row['config'] != '{}':
+                    self.store.db.execute("UPDATE jobs SET config='{}' WHERE id=?", (row['id'],))
+                continue
             if row['result']:
                 Path(row['result']).unlink(missing_ok=True)
             shutil.rmtree(Path(row['source']).parent, ignore_errors=True)
