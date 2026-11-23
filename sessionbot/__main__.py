@@ -20,7 +20,22 @@ from .storage import Store
 MODES = {'check': 'Проверить авторизацию', 'spam': 'Проверить через @SpamBot',
          'terminate': 'Завершить другие сеансы', 'clear_contacts': 'Очистка: все контакты',
          'clear_drafts': 'Очистка: все облачные черновики',
-         'migrate': 'Миграция в новую авторизацию'}
+         'migrate': 'Миграция в новую авторизацию',
+         'migrate_clean': 'Новая сессия → очистка → выход'}
+
+
+CLEANUP_CONFIRMATION = (
+    'Бот войдёт в новую авторизацию, проверит аккаунт и сохранит новую сессию до очистки. '
+    'Через новую авторизацию будут сброшены профиль и username, удалены фото, контакты, '
+    'папки, стикеры, черновики, Избранное и история диалогов; выполнен выход из групп и каналов, '
+    'удалены каналы создателя, заблокированы боты, очищены платёжные данные. '
+    'Изменятся настройки приватности, срок автоудаления аккаунта будет установлен в 30 дней, '
+    'будут завершены веб-авторизации. Это необратимые действия. '
+    'После повторного сохранения .session, .json и ZIP будет завершена ТОЛЬКО загруженная старая авторизация. '
+    'Новая авторизация, её файлы и другие созданные новые сеансы сохранятся. '
+    'При неполной очистке или ошибке сохранения старая авторизация не отзывается. '
+    'Доставку кода определяет Telegram; она не гарантируется.'
+)
 
 
 STATES = {'draft': 'выбор режима', 'queued': 'в очереди', 'running': 'выполняется',
@@ -43,7 +58,11 @@ async def main():
     except BlockingIOError:
         raise RuntimeError('На этом диске уже запущен процесс. Локальная блокировка не защищает другие серверы.') from None
     store = Store(root)
-    shutil.rmtree(root / 'work', ignore_errors=True)
+    for work in (root / 'work').glob('*'):
+        interrupted = store.get(work.name)
+        if interrupted and interrupted['mode'] == 'migrate_clean' and (work / 'new.session').exists():
+            continue  # May be the only new session if checkpoint storage failed.
+        shutil.rmtree(work, ignore_errors=True)
     shutil.rmtree(root / 'staging', ignore_errors=True)
     for temporary in (root / 'results').glob('*.tmp'):
         temporary.unlink(missing_ok=True)
@@ -74,7 +93,8 @@ async def main():
     @dispatcher.message(Command('start', 'help'))
     async def help_message(message):
         await message.answer('Загрузите .session или ZIP с парами .session + .json. Затем выберите отдельный режим для каждой задачи.\n'
-                             'Обычная проверка ничего не удаляет. Выберите удаление контактов или облачных черновиков отдельным действием.\n'
+                             'Обычная проверка ничего не удаляет. Контакты и черновики удаляются отдельными действиями.\n'
+                             'Режим «Новая сессия → очистка → выход» создаёт новую авторизацию, очищает аккаунт и завершает только исходную. Перед запуском прочитайте полный список действий.\n'
                              '/status — задачи; /pause — приостановить запуск очереди; /resume — продолжить; /cancel [ID] — отменить; '
                              '/archives — сохранённые результаты; /settings — настройки; /version — версия.\n'
                              'Пауза не прерывает уже выполняющиеся операции. Отмена не отменяет выполненные действия Telegram.\n'
@@ -88,7 +108,7 @@ async def main():
 
     @dispatcher.message(Command('settings'))
     async def settings(message):
-        await message.answer(f'Параллельность: {concurrency}\nХранение: {retention} дней\nМаксимум загрузки: {limit // 1048576} МБ\n'
+        await message.answer(f'Параллельность: {concurrency}\nХранение обычных результатов: {retention} дней\nНовые сессии комбинированного режима — без автоудаления.\nМаксимум загрузки: {limit // 1048576} МБ\n'
                              'Изменение через переменные Railway. API_ID/API_HASH берутся только из окружения. JSON: параметры устройства, proxy, password/twoFA/two_fa.')
 
     @dispatcher.message(Command('status'))
@@ -125,6 +145,7 @@ async def main():
 
     @dispatcher.message(Command('archives'))
     async def archives(message):
+        store.recover_new_sessions(message.from_user.id)
         rows = [r for r in store.rows(message.from_user.id) if r['result'] and Path(r['result']).is_file()]
         if not rows:
             await message.answer('Сохранённых результатов нет')
@@ -177,8 +198,9 @@ async def main():
             await callback.answer('Задача недоступна')
             return
         await callback.answer()
-        if mode in {'terminate', 'clear_contacts', 'clear_drafts'}:
+        if mode in {'terminate', 'clear_contacts', 'clear_drafts', 'migrate_clean'}:
             actions = {
+                'migrate_clean': CLEANUP_CONFIRMATION,
                 'terminate': 'Завершить все другие авторизации. Загруженную сохранить.',
                 'clear_contacts': 'Удалить ВСЕ контакты аккаунта. Это необратимо.',
                 'clear_drafts': 'Удалить ВСЕ облачные черновики сообщений аккаунта. Это необратимо.',
@@ -202,7 +224,7 @@ async def main():
     async def confirm(callback):
         _, ident, mode = callback.data.split(':')
         job = store.get(ident, callback.from_user.id)
-        if job and job['state'] == 'draft' and mode in {'terminate', 'clear_contacts', 'clear_drafts'}:
+        if job and job['state'] == 'draft' and mode in {'terminate', 'clear_contacts', 'clear_drafts', 'migrate_clean'}:
             store.db.execute("UPDATE jobs SET mode=?,state='queued',stage='Подтверждено пользователем' WHERE id=? AND state='draft'", (mode, ident))
             await callback.message.answer(f'Задача {ident} поставлена в очередь')
         await callback.answer()

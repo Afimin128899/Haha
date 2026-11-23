@@ -11,3 +11,5 @@ data
 *.sqlite*
 *.zip
 .codex-attachments
+new_sessions/
+recovery/

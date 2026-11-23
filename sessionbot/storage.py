@@ -19,8 +19,22 @@ class Store:
         CREATE TABLE IF NOT EXISTS aliases(fingerprint TEXT PRIMARY KEY, account TEXT);
         CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, paused INTEGER DEFAULT 0);
         CREATE UNIQUE INDEX IF NOT EXISTS account_lock ON jobs(account) WHERE state='running';''')
+        self.recover_new_sessions()
         # Interrupted destructive operations must never be replayed automatically.
         self.db.execute("UPDATE jobs SET state='interrupted',stage='Прервано перезапуском; создайте новую задачу' WHERE state='running'")
+
+    def recover_new_sessions(self, owner=None):
+        query = "SELECT id,owner FROM jobs WHERE mode='migrate_clean' AND result IS NULL"
+        params = ()
+        if owner is not None:
+            query += ' AND owner=?'
+            params = (owner,)
+        for row in self.db.execute(query, params).fetchall():
+            for phase in ('after_cleanup', 'before_cleanup'):
+                archive = self.root / 'new_sessions' / str(row['owner']) / row['id'] / phase / 'account.zip'
+                if archive.is_file() and not archive.is_symlink():
+                    self.update(row['id'], result=str(archive))
+                    break
 
     def add(self, owner, account, source, config, mode):
         alias = self.db.execute('SELECT account FROM aliases WHERE fingerprint=?', (account,)).fetchone()
