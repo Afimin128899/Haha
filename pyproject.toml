@@ -1,0 +1,14 @@
+[project]
+name = "private-session-bot"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = ["aiogram==3.22.0", "Telethon==1.41.2", "PySocks==1.7.1"]
+[project.optional-dependencies]
+test = ["pytest==8.4.2", "pytest-asyncio==1.2.0"]
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+[tool.setuptools.packages.find]
+include = ["sessionbot*"]
